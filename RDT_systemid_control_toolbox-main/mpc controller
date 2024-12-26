@@ -1,0 +1,138 @@
+import mujoco as mj
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from mujoco.glfw import glfw
+from mujoco_base import MuJoCoBase
+from scipy.optimize import minimize
+
+
+class kuka_iiwa14(MuJoCoBase):
+    def __init__(self, xml_path):
+        super().__init__(xml_path)
+        self.timeframe = 0
+        self.Kp = 100  # initial derivative gain
+        self.Kd = 10   # initial proportional gain
+
+    def load_exp_data(self, pathTodata):
+        """load csv"""
+        self.exp_data = pd.read_csv(pathTodata)
+
+    def reset(self):
+        """reset simulation env and camera angle"""
+        self.cam.azimuth = 120.89
+        self.cam.elevation = -15.81
+        self.cam.distance = 5.0
+        self.cam.lookat = np.array([0.0, 0.0, 1.0])
+        self.opt.flags[mj.mjtVisFlag.mjVIS_CONTACTPOINT] = True
+        self.opt.flags[mj.mjtVisFlag.mjVIS_CONTACTFORCE] = True
+        self.timeframe = 0
+
+    def pid_controller(self, target_position):
+        """pid controller based on target simulation"""
+        error = target_position - self.data.qpos[:]
+        d_error = -self.data.qvel[:]
+        pid_torque = self.Kp * error + self.Kd * d_error
+        return pid_torque
+
+    def optimize_pid(self, target_position):
+        """优化 PID parameter"""
+        def cost_function(params):
+            Kp, Kd = params
+            error = target_position - self.data.qpos[:]
+            d_error = -self.data.qvel[:]
+            torque = Kp * error + Kd * d_error
+            cost = np.sum(error**2) + 0.01 * np.sum(torque**2)
+            return cost
+
+        bounds = [(10, 500), (1, 50)]
+        initial_guess = [self.Kp, self.Kd]
+        res = minimize(cost_function, initial_guess, bounds=bounds, method='L-BFGS-B')
+        return res.x
+
+    def sysid_actuation(self):
+        """ (mt1-mt7)"""
+        for i in range(self.data.ctrl.shape[0]):
+            torque_id = f"mt{i+1}"
+            self.data.ctrl[i] = self.exp_data[torque_id][self.timeframe]
+
+    def simulate(self, use_pid=False, optimize_pid=False):
+        glfw.set_window_title(self.window, "KUKA iiwa 14 Simulation")
+
+        joint_positions = []
+        joint_torques = []
+
+        while not glfw.window_should_close(self.window):
+            simstart = self.data.time
+
+            while (self.data.time - simstart < 1.0 / 200.0):
+                if self.timeframe >= len(self.exp_data):
+                    print("End of experimental data reached.")
+                    glfw.set_window_should_close(self.window, True)
+                    break
+
+                target_position = self.exp_data.iloc[self.timeframe][
+                    ["mp1", "mp2", "mp3", "mp4", "mp5", "mp6", "mp7"]
+                ].to_numpy()
+
+                if use_pid:
+                    if optimize_pid and self.timeframe % 50 == 0:
+                        self.Kp, self.Kd = self.optimize_pid(target_position)
+                    pid_torque = self.pid_controller(target_position)
+                    self.data.ctrl[:] = pid_torque
+                else:
+                    self.sysid_actuation()
+
+                mj.mj_step(self.model, self.data)
+                joint_positions.append(self.data.qpos[:].copy())
+                joint_torques.append(self.data.ctrl[:].copy())
+
+                if self.timeframe % 10 == 0:
+                    viewport_width, viewport_height = glfw.get_framebuffer_size(self.window)
+                    viewport = mj.MjrRect(0, 0, viewport_width, viewport_height)
+                    mj.mjv_updateScene(self.model, self.data, self.opt, None, self.cam,
+                                       mj.mjtCatBit.mjCAT_ALL.value, self.scene)
+                    mj.mjr_render(viewport, self.scene, self.context)
+                    glfw.swap_buffers(self.window)
+
+                glfw.poll_events()
+                self.timeframe += 1
+
+            if self.timeframe >= len(self.exp_data):
+                break
+
+        glfw.terminate()
+
+        df = pd.DataFrame(joint_positions, columns=[f"qpos{i+1}" for i in range(self.data.qpos.shape[0])])
+        df.to_csv("simulation_results.csv", index=False)
+
+    def compare_and_plot_subplots(self, experiment_file):
+        """comparison"""
+        simulation_data = pd.read_csv("simulation_results.csv")
+        experiment_data = pd.read_csv(experiment_file)
+
+        sim_qpos = simulation_data.to_numpy()
+        target_qpos = experiment_data[["mp1", "mp2", "mp3", "mp4", "mp5", "mp6", "mp7"]].to_numpy()
+
+        time = np.linspace(0, len(sim_qpos) * 0.005, len(sim_qpos))
+
+        fig, axs = plt.subplots(7, 1, figsize=(10, 15), sharex=True)
+
+        for joint in range(sim_qpos.shape[1]):
+            axs[joint].plot(time, sim_qpos[:, joint], label=f"Simulated Joint {joint+1}")
+            axs[joint].plot(time, target_qpos[:, joint], label=f"Target Joint {joint+1}", linestyle="dashed")
+            axs[joint].set_ylabel("Position (rad)")
+            axs[joint].set_title(f"Joint {joint+1}")
+            axs[joint].legend()
+
+        axs[-1].set_xlabel("Time (s)")
+        plt.tight_layout()
+        plt.show()
+
+
+if __name__ == "__main__":
+    xml_path = "model/kuka_iiwa_14/scene.xml"
+    kukaSim = kuka_iiwa14(xml_path)
+    kukaSim.load_exp_data("sysid_data/kuka_iiwa_14/kuka_iiwa14_data.csv")
+    kukaSim.simulate(use_pid=True, optimize_pid=True)
+    kukaSim.compare_and_plot_subplots("sysid_data/kuka_iiwa_14/kuka_iiwa14_data.csv")
